@@ -1,0 +1,73 @@
+(ns craneoperations.advisor-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [craneoperations.advisor :as advisor]))
+
+(deftest test-mock-advisor-log-lift-plan
+  (testing "Mock advisor proposes a lift-plan logging operation"
+    (let [a (advisor/mock-advisor)
+          request {:type :log-lift-plan :equipment-id "crane-001"
+                    :load-planned 40000 :radius 12 :boom-angle 55}
+          proposal (advisor/propose a request {})]
+      (is (= :log-lift-plan (:op proposal)))
+      (is (= :propose (:effect proposal)))
+      (is (= 40000 (:load-planned proposal)))
+      (is (= 12 (:radius proposal)))
+      (is (= 55 (:boom-angle proposal)))
+      (is (pos? (:confidence proposal))))))
+
+(deftest test-mock-advisor-record-load-reading
+  (testing "Mock advisor proposes a load-reading recording operation"
+    (let [a (advisor/mock-advisor)
+          request {:type :record-load-reading :equipment-id "crane-001" :load-actual 38000}
+          proposal (advisor/propose a request {})]
+      (is (= :record-load-reading (:op proposal)))
+      (is (= :propose (:effect proposal)))
+      (is (= 38000 (:load-actual proposal)))
+      (is (pos? (:confidence proposal))))))
+
+(deftest test-mock-advisor-schedule-maintenance
+  (testing "Mock advisor proposes a maintenance/inspection scheduling operation"
+    (let [a (advisor/mock-advisor)
+          request {:type :schedule-maintenance :equipment-id "crane-001"
+                    :inspection-type :annual :due-date "2026-08-01"}
+          proposal (advisor/propose a request {})]
+      (is (= :schedule-maintenance-inspection (:op proposal)))
+      (is (= :propose (:effect proposal)))
+      (is (= :annual (:inspection-type proposal)))
+      (is (= "2026-08-01" (:due-date proposal))))))
+
+(deftest test-mock-advisor-flag-safety-concern
+  (testing "Mock advisor proposes a safety-concern flag operation with high confidence"
+    (let [a (advisor/mock-advisor)
+          request {:type :flag-safety-concern :equipment-id "crane-001"
+                    :concern-type :structural :description "visible boom deflection"}
+          proposal (advisor/propose a request {})]
+      (is (= :flag-safety-concern (:op proposal)))
+      (is (= :propose (:effect proposal)))
+      (is (= :structural (:concern-type proposal)))
+      (is (>= (:confidence proposal) 0.9)))))
+
+(deftest test-mock-advisor-unknown-request-type
+  (testing "Unknown request types yield :unknown op with zero confidence (forces governor rejection)"
+    (let [a (advisor/mock-advisor)
+          request {:type :something-else}
+          proposal (advisor/propose a request {})]
+      (is (= :unknown (:op proposal)))
+      (is (= 0.0 (:confidence proposal)))
+      (is (= :propose (:effect proposal))))))
+
+(deftest test-mock-advisor-never-proposes-actuation
+  (testing "None of the mock advisor's proposed ops are real machine actuation"
+    (let [a (advisor/mock-advisor)
+          forbidden #{:actuate-crane :engage-hoist :move-load :operate-boom :override-rated-capacity}
+          request-types [:log-lift-plan :record-load-reading :schedule-maintenance :flag-safety-concern]]
+      (doseq [t request-types]
+        (let [proposal (advisor/propose a {:type t :equipment-id "crane-001"} {})]
+          (is (not (contains? forbidden (:op proposal)))))))))
+
+(deftest test-llm-advisor-stub-behavior
+  (testing "LLM advisor stub always proposes with :propose effect and zero confidence (forces escalation)"
+    (let [a (advisor/llm-advisor nil)
+          proposal (advisor/propose a {:type :log-lift-plan} {})]
+      (is (= :propose (:effect proposal)))
+      (is (= 0.0 (:confidence proposal))))))

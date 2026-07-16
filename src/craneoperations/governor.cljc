@@ -1,0 +1,157 @@
+(ns craneoperations.governor
+  "CraneOperationsGovernor — the independent safety/traceability layer
+  for the ISCO-08 8343 Independent Crane & Hoist Operations Practice
+  actor. Wired as its own `:govern` node in `craneoperations.actor`'s
+  StateGraph, downstream of `:advise` — the Advisor has no notion of
+  equipment provenance, real load-chart rated-capacity limits, or
+  operational risk, so this MUST be a separate system able to reject a
+  proposal (itonami actor pattern, per ADR-2607011000 / CLAUDE.md
+  Actors section).
+
+  `check` is a pure function of (request, context, proposal, store) ->
+  verdict; it never mutates the store. The StateGraph's `:decide` node
+  routes on the verdict:
+    :hard? true                → :hold  (irreversible, no write)
+    :escalate? true            → :request-approval (interrupt-before)
+    otherwise                  → :commit
+
+  This actor NEVER controls a real crane or hoist — 'policy, not
+  control', the same boundary `kotoba.robotics` establishes throughout
+  this fleet for every manufacturing actor's robotics namespace — and
+  NEVER overrides a real load-chart/rated-capacity limit. It only
+  coordinates paperwork (lift-plan logging, load-reading recording,
+  maintenance scheduling, safety flags) and independently re-verifies
+  recorded lift data against real, disclosed rated-capacity bounds.
+
+  HARD invariants (:hard? true, ALWAYS :hold, never overridable):
+    1. equipment-provenance (spec-basis) — a proposal referencing a
+       specific piece of equipment (`equipment-scoped-ops`) must
+       reference equipment that is actually registered; this actor
+       never invents a crane/hoist unit or its rated capacity.
+    2. no-actuation             — proposal :effect must be :propose.
+    3. forbidden-ops            — proposals touching real crane/hoist
+                                   actuation (moving a load, engaging a
+                                   hoist, operating a boom) or override
+                                   of a rated-capacity limit NEVER
+                                   PROCEED (closed allowlist enforced
+                                   here + in advisor — the advisor
+                                   itself never proposes these, this is
+                                   defense in depth).
+    4. load-vs-rated-capacity   — for `:log-lift-plan` /
+                                   `:record-load-reading`, INDEPENDENTLY
+                                   recompute whether the proposal's own
+                                   reported load value falls outside
+                                   [0, rated-capacity] — rated-capacity
+                                   is read from the equipment's OWN
+                                   registered record in the store
+                                   (ground truth), never taken from the
+                                   proposal's self-report. Mirrors this
+                                   fleet's two-sided range-check family
+                                   (e.g. `autoparts.registry/part-lot-
+                                   dppm-out-of-range?`).
+
+  ESCALATION invariants (:escalate? true, ALWAYS human sign-off):
+    5. safety-concern            — `:flag-safety-concern` ALWAYS
+                                    escalates, regardless of confidence.
+    6. maintenance-overdue       — a lift-plan or load-reading proposal
+                                    against equipment flagged
+                                    `:maintenance-overdue?` in the store
+                                    (scheduling maintenance itself is
+                                    NOT escalated — that is the desired
+                                    remedy, not the risk).
+    7. low confidence            (< `confidence-floor`)."
+  (:require [craneoperations.store :as store]))
+
+(def confidence-floor 0.6)
+
+; Permanently forbidden operation categories — real machine actuation
+; or authority to override a rated-capacity limit. This actor never
+; controls a crane or hoist; it only coordinates paperwork.
+(def ^:private forbidden-ops #{:unknown
+                                :actuate-crane
+                                :engage-hoist
+                                :move-load
+                                :operate-boom
+                                :override-rated-capacity})
+
+(def ^:private equipment-scoped-ops
+  "Ops that reference a specific piece of equipment and therefore
+   require it to already be registered (spec-basis / provenance)."
+  #{:log-lift-plan :record-load-reading :schedule-maintenance-inspection})
+
+(def ^:private load-bearing-ops
+  "Ops that carry a real load value to independently re-verify against
+   the equipment's own registered rated-capacity."
+  #{:log-lift-plan :record-load-reading})
+
+(defn lift-load-out-of-range?
+  "Does a lift reading's own `:load-actual` (kg) fall outside the safe
+   operating range implied by its own `:rated-capacity` (kg) — below
+   zero (physically impossible / data corruption) or above the rated
+   capacity itself (an overload — the crane's load-chart limit, the
+   ASME B30.5 / OSHA 1926.1417-style hard ceiling this practice never
+   overrides)? A pure ground-truth check against the reading's own
+   recorded numeric fields — no reliance on any self-reported
+   within-capacity claim. A further sibling in this fleet's two-sided
+   range-check family (see `autoparts.registry/part-lot-dppm-out-of-
+   range?` and its docstring for the lineage)."
+  [{:keys [load-actual rated-capacity]}]
+  (and (number? load-actual) (number? rated-capacity)
+       (or (neg? load-actual)
+           (> load-actual rated-capacity))))
+
+(defn- proposal-load-value
+  "Extract the real load value a load-bearing proposal carries — planned
+   load for a lift plan, actual (telemetry-derived) load for a reading."
+  [proposal]
+  (case (:op proposal)
+    :log-lift-plan (:load-planned proposal)
+    :record-load-reading (:load-actual proposal)
+    nil))
+
+(defn- hard-violations [{:keys [proposal]} equipment-record]
+  (cond-> []
+    (and (contains? equipment-scoped-ops (:op proposal)) (nil? equipment-record))
+    (conj {:rule :no-equipment-provenance
+           :detail "equipment not registered — this actor never invents a crane/hoist unit or its rated capacity"})
+
+    (not= :propose (:effect proposal))
+    (conj {:rule :no-actuation
+           :detail "effect must be :propose only (no direct store writes, no real machine actuation)"})
+
+    (contains? forbidden-ops (:op proposal))
+    (conj {:rule :forbidden-op
+           :detail "operation outside permitted scope (real crane/hoist actuation and rated-capacity override are permanently forbidden)"})
+
+    (and equipment-record
+         (contains? load-bearing-ops (:op proposal))
+         (lift-load-out-of-range? {:load-actual (proposal-load-value proposal)
+                                    :rated-capacity (:rated-capacity equipment-record)}))
+    (conj {:rule :load-exceeds-rated-capacity
+           :detail (str "recorded load " (proposal-load-value proposal)
+                        " falls outside equipment's own registered rated-capacity bound "
+                        (:rated-capacity equipment-record))})))
+
+(defn- maintenance-overdue-escalate? [equipment-record proposal]
+  (and equipment-record
+       (:maintenance-overdue? equipment-record)
+       (contains? load-bearing-ops (:op proposal))))
+
+(defn check
+  "Assess a proposal against `request`/`context`/`proposal` and a
+  `store` implementing `craneoperations.store/Store`. Returns
+  `{:ok? bool :violations [...] :confidence n :hard? bool :escalate? bool}`."
+  [request context proposal store]
+  (let [equipment-id (:equipment-id request)
+        equipment-record (when equipment-id (store/equipment store equipment-id))
+        hard (hard-violations {:proposal proposal} equipment-record)
+        hard? (boolean (seq hard))
+        conf (or (:confidence proposal) 0.0)
+        low? (< conf confidence-floor)
+        safety-concern? (= :flag-safety-concern (:op proposal))
+        overdue-escalate? (maintenance-overdue-escalate? equipment-record proposal)]
+    {:ok? (and (not hard?) (not low?) (not safety-concern?) (not overdue-escalate?))
+     :violations hard
+     :confidence conf
+     :hard? hard?
+     :escalate? (and (not hard?) (or low? safety-concern? overdue-escalate?))}))
