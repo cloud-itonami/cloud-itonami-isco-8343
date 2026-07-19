@@ -1,0 +1,309 @@
+(ns craneoperations.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300)
+  for cloud-itonami-isco-8343: this repo previously had no demo page and
+  no generator at all (only a README line pointing at a file that did
+  not exist yet).
+
+  IMPORTANT — this demo build follows a real bug fix, not a workaround:
+  `craneoperations.actor`'s `commit-node` and `approve!` previously never
+  called `store/add-record!` — they only updated the ephemeral in-state
+  `:records` counter, so the persistent audit ledger (`store/records`)
+  was silently never populated despite the store/actor namespace
+  docstrings describing an append-only audit trail. That gap was found
+  while screening this repo for this very demo build and was fixed at
+  the root cause in `actor.cljc` (see that namespace's `commit-node`/
+  `approve!` docstrings and the separate `fix(actor): ...` commit this
+  demo commit follows) rather than worked around here. This generator
+  would otherwise have rendered an audit trail that was always empty.
+
+  This namespace drives the REAL actor stack
+  (`craneoperations.actor` built against
+  `craneoperations.advisor/mock-advisor` and a real
+  `craneoperations.store/MemStore`) through a scenario built from:
+    - the existing test fixture's seed data verbatim (`crane-001`
+      \"Liebherr LTM 1100\", rated-capacity 100000 kg, NOT
+      maintenance-overdue — taken from
+      `test/craneoperations/actor_test.cljc`'s `registered-store`)
+    - one disclosed demo-only addition, `crane-002` (\"Grove GMK5250L\",
+      rated-capacity 250000 kg, maintenance-overdue TRUE) — registered
+      here via the real `store/register-equipment!` API, the same
+      equipment id/shape already used inline in several
+      `governor_test.cljc` maintenance-overdue tests, not invented data.
+
+  Every other field this page displays is real output read after the
+  compiled StateGraph actually ran (`actor/run-request!` / `actor/approve!`).
+  No timestamps or random values are embedded in the page content, so the
+  output is byte-identical across reruns against the same seed.
+
+  Architecture note (honest, not a new bug — see ns docstring of
+  `craneoperations.actor`): `store-instance` is closed over by
+  `actor/build-graph` as an immutable value, so a single compiled graph
+  does not see writes from a *later* `run-request!`/`approve!` call made
+  against a different, freshly-returned store. To show a cumulative
+  ledger across the whole demo (rather than each op only ever seeing its
+  own single resulting record), this generator rebuilds the graph before
+  each op-spec, threading the previous step's returned `:store` value in
+  as the next step's seed (a hard-hold does not return an updated
+  `:store` at all, since nothing was written — the prior store carries
+  forward unchanged) — see `run-op!`/`run-demo!` below. This mirrors the
+  approach used for cloud-itonami-isco-5419's operator console.
+
+  Two governor rules are NOT reachable through `run-request!` with
+  `mock-advisor` and are disclosed as such rather than silently omitted:
+    - `no-actuation` — `mock-advisor` always returns `:effect :propose`,
+      so a non-`:propose` effect can never arise from a real proposal;
+      `governor_test.cljc`'s `test-wrong-effect-is-hard-violation`
+      exercises this rule directly against `governor/check` instead.
+    - low-confidence escalation — `mock-advisor`'s per-request-type
+      confidence values (0.8-0.95) are all fixed and all clear the 0.6
+      floor; `governor_test.cljc`'s `test-low-confidence-escalation`
+      exercises this rule directly against `governor/check` instead.
+
+  Usage: `clojure -M:render-html [out-file]` (default
+  `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [craneoperations.store :as store]
+            [craneoperations.advisor :as advisor]
+            [craneoperations.actor :as actor]))
+
+(def ^:private op-specs
+  "The demo scenario: one request map per row of the audit trail, chosen to
+   drive through as many real hard-violation/escalation rules as the real
+   advisor/governor/store API allow. Comment on each documents which rule
+   (if any) it is expected to trigger."
+  [;; 1. Clean lift plan, within crane-001's own registered rated capacity
+   ;;    (100000 kg) -> commit.
+   {:type :log-lift-plan :equipment-id "crane-001"
+    :load-planned 50000 :radius 10 :boom-angle 60}
+
+   ;; 2. Clean load reading, within capacity -> commit.
+   {:type :record-load-reading :equipment-id "crane-001"
+    :load-actual 40000}
+
+   ;; 3. Scheduling maintenance against equipment that IS flagged
+   ;;    maintenance-overdue is itself the desired remedy, not escalated
+   ;;    (contrast with #6/#7 below) -> commit.
+   {:type :schedule-maintenance :equipment-id "crane-002"
+    :inspection-type :annual :due-date "2026-08-01"}
+
+   ;; 4. Planned load above crane-001's own 100000 kg rated capacity
+   ;;    -> :load-exceeds-rated-capacity hold.
+   {:type :log-lift-plan :equipment-id "crane-001"
+    :load-planned 150000 :radius 10 :boom-angle 60}
+
+   ;; 5. A physically-impossible negative load reading -> also
+   ;;    :load-exceeds-rated-capacity (the same ground-truth range check
+   ;;    covers both the overload and the corruption case).
+   {:type :record-load-reading :equipment-id "crane-001"
+    :load-actual -10}
+
+   ;; 6. Lift plan against equipment flagged maintenance-overdue (within
+   ;;    ITS OWN 250000 kg capacity, so this is purely the overdue
+   ;;    escalation, not a capacity violation) -> :awaiting-approval ->
+   ;;    approve!.
+   {:type :log-lift-plan :equipment-id "crane-002"
+    :load-planned 50000 :radius 12 :boom-angle 55}
+
+   ;; 7. Load reading against the same overdue equipment -> also escalates
+   ;;    -> approve!.
+   {:type :record-load-reading :equipment-id "crane-002"
+    :load-actual 60000}
+
+   ;; 8. Safety-concern flag ALWAYS escalates, regardless of confidence
+   ;;    -> :awaiting-approval -> approve!.
+   {:type :flag-safety-concern :equipment-id "crane-001"
+    :concern-type :structural :description "visible boom deflection"}
+
+   ;; 9. Equipment that was never registered at all
+   ;;    -> :no-equipment-provenance hold.
+   {:type :log-lift-plan :equipment-id "ghost-crane-9"
+    :load-planned 5000 :radius 8 :boom-angle 45}
+
+   ;; 10. An unrecognized request type maps to {:op :unknown ...} via
+   ;;     mock-advisor's case default, which is itself a permanently
+   ;;     forbidden op -> :forbidden-op hold.
+   {:type :not-a-real-operation :equipment-id "crane-001"}])
+
+(defn- run-op!
+  "Build a fresh compiled graph against the CURRENT store value, run one
+   request through it to completion, and (if it stopped at
+   :awaiting-approval) immediately approve it as a human sign-off would.
+   Returns a map describing this step's outcome plus the store value to
+   carry into the next step (a hard-hold never writes, so the current
+   store carries forward unchanged)."
+  [advisor-instance current-store request]
+  (let [graph (actor/build-graph advisor-instance current-store)
+        result (actor/run-request! graph request {} current-store)]
+    (case (:phase result)
+      :complete
+      {:request request :outcome :auto-committed
+       :record (last (store/records (:store result)))
+       :store (:store result)}
+
+      :awaiting-approval
+      (let [approved (actor/approve! result {:approver "site-supervisor"} current-store)]
+        {:request request :outcome :approved-and-committed
+         :record (last (store/records (:store approved)))
+         :store (:store approved)})
+
+      :rejected
+      {:request request :outcome :hard-hold
+       :error (:error result)
+       :rule (-> result :decision :violations first :rule)
+       :store current-store})))
+
+(defn run-demo!
+  "Run the whole `op-specs` scenario end-to-end against the real actor
+   stack, threading the store forward across steps (see ns docstring).
+   Returns `{:seed-equipment [...] :runs [...] :final-store store}`."
+  []
+  (let [advisor-instance (advisor/mock-advisor)
+        seed (-> (store/create-store)
+                  (store/register-equipment! "crane-001"
+                                              {:name "Liebherr LTM 1100"
+                                               :rated-capacity 100000
+                                               :maintenance-overdue? false})
+                  ;; Disclosed demo-only addition (see ns docstring) via
+                  ;; the real register-equipment! API.
+                  (store/register-equipment! "crane-002"
+                                              {:name "Grove GMK5250L"
+                                               :rated-capacity 250000
+                                               :maintenance-overdue? true}))
+        {:keys [store runs]}
+        (reduce
+         (fn [{:keys [store runs]} request]
+           (let [outcome (run-op! advisor-instance store request)]
+             {:store (:store outcome) :runs (conj runs outcome)}))
+         {:store seed :runs []}
+         op-specs)]
+    {:seed-equipment [["crane-001" (store/equipment seed "crane-001")]
+                      ["crane-002" (store/equipment seed "crane-002")]]
+     :runs runs
+     :final-store store}))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn- esc [s]
+  (some-> s str
+          (str/replace "&" "&amp;")
+          (str/replace "<" "&lt;")
+          (str/replace ">" "&gt;")))
+
+(defn- outcome-class [outcome]
+  (case outcome
+    :auto-committed "ok"
+    :approved-and-committed "ok"
+    :hard-hold "err"
+    "muted"))
+
+(defn- outcome-label [outcome]
+  (case outcome
+    :auto-committed "committed (auto)"
+    :approved-and-committed "committed (after human approval)"
+    :hard-hold "HARD HOLD"
+    (name outcome)))
+
+(def ^:private gate-rules
+  "Static description of craneoperations.governor/check's own op
+   contract, drawn from its docstring — not invented here."
+  [{:rule "no-equipment-provenance" :kind "hard" :reachable? true
+    :desc "An equipment-scoped op referencing equipment that is not registered — this actor never invents a crane/hoist unit or its rated capacity."}
+   {:rule "no-actuation" :kind "hard" :reachable? false
+    :desc "Proposal :effect must be :propose. Not reachable via mock-advisor (always :propose) — exercised directly against governor/check in governor_test.cljc."}
+   {:rule "forbidden-op" :kind "hard" :reachable? true
+    :desc "Real crane/hoist actuation (move-load/engage-hoist/operate-boom/actuate-crane), rated-capacity override, and :unknown ops are permanently excluded — no override, ever."}
+   {:rule "load-exceeds-rated-capacity" :kind "hard" :reachable? true
+    :desc "A lift-plan/load-reading's own reported load, independently re-checked against the equipment's own registered rated-capacity — below zero or above the ceiling is a hard violation."}
+   {:rule "safety-concern" :kind "escalate (always)" :reachable? true
+    :desc "flag-safety-concern ALWAYS escalates to human sign-off, regardless of confidence."}
+   {:rule "maintenance-overdue" :kind "escalate" :reachable? true
+    :desc "A lift-plan/load-reading proposal against equipment flagged maintenance-overdue escalates (scheduling the maintenance itself is the remedy, not escalated)."}
+   {:rule "low confidence (< 0.6)" :kind "escalate" :reachable? false
+    :desc "Not reachable via mock-advisor — its fixed per-type confidence values (0.8-0.95) never drop below the 0.6 floor; exercised directly against governor/check in governor_test.cljc."}])
+
+(defn- entities-table [rows cols]
+  (str "<table><thead><tr>" (apply str (map #(str "<th>" (esc %) "</th>") cols)) "</tr></thead><tbody>\n"
+       (apply str rows)
+       "</tbody></table>"))
+
+(defn- render-seed [{:keys [seed-equipment]}]
+  (str
+   "<h2>Registered equipment (seed)</h2>\n"
+   (entities-table
+    (for [[id {:keys [name rated-capacity maintenance-overdue?]}] seed-equipment]
+      (str "<tr><td>" (esc id) "</td><td>" (esc name) "</td><td>" rated-capacity " kg</td><td class=\""
+           (if maintenance-overdue? "err" "ok") "\">" (if maintenance-overdue? "OVERDUE" "current")
+           (when (= id "crane-002") " <span class=\"muted\">(disclosed demo-only addition)</span>")
+           "</td></tr>\n"))
+    ["id" "name" "rated capacity" "maintenance"])))
+
+(defn- render-gate []
+  (str
+   "<h2>Action gate — craneoperations.governor/check contract</h2>\n"
+   "<table><thead><tr><th>rule</th><th>kind</th><th>reachable via this demo?</th><th>description</th></tr></thead><tbody>\n"
+   (apply str
+          (for [{:keys [rule kind reachable? desc]} gate-rules]
+            (str "<tr><td>" (esc rule) "</td><td>" (esc kind) "</td><td class=\""
+                 (if reachable? "ok" "muted") "\">" (if reachable? "yes" "no (documented)")
+                 "</td><td>" (esc desc) "</td></tr>\n")))
+   "</tbody></table>"))
+
+(defn- render-runs [runs]
+  (str
+   "<h2>Demo run log (audit trail)</h2>\n"
+   "<p class=\"muted\">One row per request actually run through the compiled StateGraph, in order. "
+   "The store is rebuilt/rethreaded across steps (see generator docstring) so the ledger accumulates. "
+   "This ledger is only non-empty at all because of the commit/approve! ledger-persistence fix that "
+   "landed immediately before this demo (see ns docstring).</p>\n"
+   "<table><thead><tr><th>#</th><th>equipment</th><th>op (request :type)</th><th>outcome</th>"
+   "<th>violated rule</th><th>ledger record type</th></tr></thead><tbody>\n"
+   (apply str
+          (map-indexed
+           (fn [i {:keys [request outcome rule record]}]
+             (str "<tr><td>" (inc i) "</td><td>" (esc (:equipment-id request)) "</td><td>"
+                  (esc (name (:type request))) "</td><td class=\"" (outcome-class outcome) "\">"
+                  (esc (outcome-label outcome)) "</td><td>" (esc (some-> rule name)) "</td><td>"
+                  (esc (some-> record :type name)) "</td></tr>\n"))
+           runs))
+   "</tbody></table>"))
+
+(defn render [demo-result]
+  (str
+   "<html><head><meta charset=\"utf-8\">"
+   "<title>cloud-itonami-isco-8343 — Crane Operations operator console (sample)</title>"
+   "<style>"
+   "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}"
+   "h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ddd;padding-bottom:.25rem}"
+   "table{border-collapse:collapse;width:100%;margin:.5rem 0 1rem}"
+   "th,td{border:1px solid #ddd;padding:.4rem .6rem;text-align:left;font-size:.92rem}"
+   "th{background:#f4f4f4}"
+   ".ok{color:#0a7a2f;font-weight:600}.err{color:#b3261e;font-weight:600}.warn{color:#a35a00;font-weight:600}"
+   ".critical{color:#fff;background:#b3261e;font-weight:700}.muted{color:#6b6b6b}"
+   "footer{margin-top:2rem;color:#6b6b6b;font-size:.85rem}"
+   "</style></head><body>\n"
+   "<h1>cloud-itonami-isco-8343 — Independent Crane &amp; Hoist Operations Practice</h1>\n"
+   "<p class=\"muted\">Build-time-generated operator console sample. Every table below is real output "
+   "of running <code>craneoperations.actor</code>'s compiled StateGraph "
+   "(<code>craneoperations.advisor/mock-advisor</code> + a real "
+   "<code>craneoperations.store/MemStore</code>) against a real request scenario. "
+   "No timestamps or random data appear in this page; it is regenerated by "
+   "<code>clojure -M:render-html</code> (see <code>.github/workflows/regenerate.yml</code>) and is "
+   "byte-identical across reruns against the same seed. This demo follows a root-cause fix to "
+   "<code>commit-node</code>/<code>approve!</code>, which previously never wrote to the store's own "
+   "audit ledger at all — see the generator's namespace docstring for details.</p>\n"
+   (render-seed demo-result) "\n"
+   (render-gate) "\n"
+   (render-runs (:runs demo-result)) "\n"
+   "<footer>Generated by <code>craneoperations.render-html</code> — "
+   "no fabricated data, no invented timestamps. "
+   "Two governor rules (<code>no-actuation</code>, low-confidence escalation) are not reachable "
+   "through this demo's mock advisor and are disclosed as such above rather than omitted silently.</footer>\n"
+   "</body></html>\n"))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        result (run-demo!)
+        html (render result)]
+    (spit out html)
+    (println "wrote" out)))
