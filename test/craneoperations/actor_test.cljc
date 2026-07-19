@@ -79,3 +79,24 @@
       (is (= :awaiting-approval (:phase held)))
       (is (= :commit (:phase approved)))
       (is (= {:approver "site-supervisor"} (:approval approved))))))
+
+(deftest test-clean-proposal-persists-to-store-ledger
+  (testing "commit-node actually appends to the store's own audit ledger, not just the ephemeral state counter"
+    (let [st (registered-store)
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:type :log-lift-plan :equipment-id "crane-001"
+                    :load-planned 50000 :radius 10 :boom-angle 60}
+          final (actor/run-request! g request {} st)]
+      (is (= 1 (count (store/records (:store final)))))
+      (is (= :log-lift-plan (:type (first (store/records (:store final)))))))))
+
+(deftest test-approve!-persists-to-store-ledger
+  (testing "approve! also appends to the store's own audit ledger upon human sign-off"
+    (let [st (registered-store)
+          g (actor/build-graph (advisor/mock-advisor) st)
+          request {:type :flag-safety-concern :equipment-id "crane-001"
+                    :concern-type :structural :description "visible boom deflection"}
+          held (actor/run-request! g request {} st)
+          approved (actor/approve! held {:approver "site-supervisor"} st)]
+      (is (= 1 (count (store/records (:store approved)))))
+      (is (true? (:approved (first (store/records (:store approved)))))))))
