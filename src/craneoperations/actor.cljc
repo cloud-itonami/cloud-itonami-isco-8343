@@ -82,12 +82,21 @@
   (:phase (decide-node state)))
 
 (defn- commit-node
-  "Commit node: Store the proposal as a record."
+  "Commit node: append the proposal as an immutable record to the
+   store's audit ledger (fixed: previously only updated the ephemeral
+   in-state :records counter and never called `store/add-record!`, so
+   the persistent ledger (`store/records`) was silently never
+   populated -- found during flagship-checklist-item-2 demo-build
+   screening, fixed at the root cause here rather than worked around
+   in the demo. Mirrors the working `commit-node` pattern in
+   `packingfulfillment.actor` (cloud-itonami-isco-9321), the reference
+   implementation this pattern was copied from)."
   [state store-instance]
   (let [proposal (:proposal state)
-        op (:op proposal)]
+        op (:op proposal)
+        store' (store/add-record! store-instance op proposal)]
     (-> state
-        (assoc :phase :complete)
+        (assoc :phase :complete :store store')
         (update :records (fn [r] (conj (or r []) {:recorded true :op op}))))))
 
 (defn- request-approval-node
@@ -141,8 +150,14 @@
 (defn approve!
   "Approve a request that reached :awaiting-approval. Human sign-off
    for escalation invariants. Computes the post-approval commit state
-   directly — see ns docstring: this does not resume a suspended
-   graph (none is suspended in this build), it advances the state the
-   caller already holds."
+   directly (see ns docstring: no suspended graph resume in this
+   build) AND appends the approved proposal to the store's audit
+   ledger (fixed: mirrors commit-node's fix and
+   `packingfulfillment.actor/approve!`'s pattern -- previously `store`
+   was accepted but silently unused, so approvals were never
+   persisted either)."
   [state approval-context store]
-  (assoc state :phase :commit :approval approval-context))
+  (let [proposal (:proposal state)
+        op (:op proposal)
+        store' (store/add-record! store op (assoc proposal :approved true :approval approval-context))]
+    (assoc state :phase :commit :approval approval-context :store store')))
