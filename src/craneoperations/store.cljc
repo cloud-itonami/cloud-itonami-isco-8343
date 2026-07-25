@@ -32,7 +32,7 @@
   (register-equipment! [this equipment-id equipment-data]
     (MemStore. (assoc equipment-units equipment-id equipment-data) ledger))
   (add-record! [this record-type record-data]
-    (let [record (assoc record-data :type record-type :timestamp (System/currentTimeMillis))]
+    (let [record (assoc record-data :type record-type :timestamp #?(:clj (System/currentTimeMillis) :cljs (.getTime (js/Date.))))]
       (MemStore. equipment-units (conj ledger record))))
   (records [this]
     ledger))
