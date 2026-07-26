@@ -62,7 +62,8 @@
 
   Usage: `clojure -M:render-html [out-file]` (default
   `docs/samples/operator-console.html`)."
-  (:require [clojure.string :as str]
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
             [craneoperations.store :as store]
             [craneoperations.advisor :as advisor]
             [craneoperations.actor :as actor]))
@@ -273,14 +274,7 @@
    "<html><head><meta charset=\"utf-8\">"
    "<title>cloud-itonami-isco-8343 — Crane Operations operator console (sample)</title>"
    "<style>"
-   "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}"
-   "h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ddd;padding-bottom:.25rem}"
-   "table{border-collapse:collapse;width:100%;margin:.5rem 0 1rem}"
-   "th,td{border:1px solid #ddd;padding:.4rem .6rem;text-align:left;font-size:.92rem}"
-   "th{background:#f4f4f4}"
-   ".ok{color:#0a7a2f;font-weight:600}.err{color:#b3261e;font-weight:600}.warn{color:#a35a00;font-weight:600}"
-   ".critical{color:#fff;background:#b3261e;font-weight:700}.muted{color:#6b6b6b}"
-   "footer{margin-top:2rem;color:#6b6b6b;font-size:.85rem}"
+   (jp-go-dds.skin/dds+skin)
    "</style></head><body>\n"
    "<h1>cloud-itonami-isco-8343 — Independent Crane &amp; Hoist Operations Practice</h1>\n"
    "<p class=\"muted\">Build-time-generated operator console sample. Every table below is real output "
