@@ -24,7 +24,7 @@
     - the existing test fixture's seed data verbatim (`crane-001`
       \"Liebherr LTM 1100\", rated-capacity 100000 kg, NOT
       maintenance-overdue — taken from
-      `test/craneoperations/actor_test.cljc`'s `registered-store`)
+      `test/craneoperations/actor_test.cljk`'s `registered-store`)
     - one disclosed demo-only addition, `crane-002` (\"Grove GMK5250L\",
       rated-capacity 250000 kg, maintenance-overdue TRUE) — registered
       here via the real `store/register-equipment!` API, the same
