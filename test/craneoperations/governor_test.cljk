@@ -3,7 +3,7 @@
    `store/create-store`, `store/register-equipment!`) — never a private
    var directly. (cloud-itonami-isic-0710 broke for a full day earlier
    in this fleet's history from exactly that mistake; do not repeat it.)"
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [craneoperations.governor :as gov]
             [craneoperations.store :as store]))
 

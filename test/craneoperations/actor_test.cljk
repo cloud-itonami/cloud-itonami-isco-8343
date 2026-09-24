@@ -5,7 +5,7 @@
    (`officer-admin.actor`) was never exercised this way, and turned
    out to call a `graph/state-graph-builder` fn that does not exist in
    the pinned dependency. Exercises ONLY public functions."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [langgraph.graph :as graph]
             [langchain.runnable :as runnable]
             [craneoperations.actor :as actor]

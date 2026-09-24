@@ -1,5 +1,5 @@
 (ns craneoperations.advisor-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [craneoperations.advisor :as advisor]))
 
 (deftest test-mock-advisor-log-lift-plan
