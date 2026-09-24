@@ -1,0 +1,32 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:physics` runs it.
+;;
+;; README "Robotics premise": a load-inspection and rigging-log robot performs
+;; pre-lift inspection checklist logging and load-weight verification for a
+;; crane crew (ISCO 8343). Its physical work: proof-loading a rigging
+;; component before it goes on the hook, and placing calibration test weights
+;; on the crane's load cell to verify the load-weight reading.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isco-8343"
+ :cases
+ [{:id :rigging-rod-proof-load
+   :kind :material
+   :procedure "pull a 100 mm long, 100 mm2 mild-steel rigging rod (shackle-pin surrogate) to the proof load before it is used in a lift"
+   :params {:length-m 0.10 :area-m2 1.0e-4 :youngs-modulus-pa 200.0e9 :yield-stress-pa 250.0e6
+            :hardening-pa 1.0e9 :density-kg-m3 7850.0}
+   :sweep {:param :max-force-n :values [10000.0 15000.0 20000.0 25000.0 30000.0]}
+   :quantity :final-strain
+   :limit {:max 0.00125 :basis "estimate: a proof load must stay elastic; the elastic yield strain of the assumed mild steel is sigma_y/E = 250 MPa / 200 GPa = 1.25e-3 (material values assumed, not from a mill certificate)"}
+   :boundary {:lo 10000.0 :hi 30000.0}}
+  {:id :test-weight-on-load-cell
+   :kind :manipulator
+   :procedure "arm lifts a calibration test weight from the cart and sets it on the crane's load-cell hook plate"
+   :params {:l1-m 0.60 :l2-m 0.50 :m1-kg 8.0 :m2-kg 5.0
+            :from [0.70 0.00] :to [0.30 0.80] :duration-s 3.0 :steps 500}
+   :sweep {:param :payload-kg :values [5.0 10.0 15.0 20.0 25.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 250.0 :basis "estimate: continuous shoulder torque of a ~20 kg-payload industrial arm"}
+   :boundary {:lo 1.0 :hi 60.0}}]}
